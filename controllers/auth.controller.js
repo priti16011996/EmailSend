@@ -44,3 +44,17 @@ exports.login = async (req, res) => {
     });
   }
 };
+
+exports.resendOTP = async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    const result = await authService.resendOTP(email);
+
+    res.status(200).json(result);
+  } catch (error) {
+    res.status(400).json({
+      message: error.message,
+    });
+  }
+};

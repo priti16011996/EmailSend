@@ -1,6 +1,5 @@
 const User = require("../models/user.model");
 const OTP = require("../models/otp.model");
-
 const bcrypt = require("bcryptjs");
 
 const generateOTP = require("../utils/generateOTP");
@@ -13,30 +12,66 @@ const generateToken = require("../utils/generateToken");
 const registerUser = async (name, email, password) => {
   const existingUser = await User.findOne({ email });
 
-  if (existingUser) {
+  // Already verified
+  if (existingUser && existingUser.isVerified) {
     throw new Error("User already exists");
   }
 
+  // Existing but unverified user
+  if (existingUser && !existingUser.isVerified) {
+    const otp = generateOTP();
+
+    const hashedOTP = await bcrypt.hash(otp, 10);
+
+    await OTP.findOneAndUpdate(
+      { email },
+      {
+        otp: hashedOTP,
+        expiresAt: new Date(Date.now() + 10 * 60 * 1000),
+        lastSentAt: new Date(),
+      },
+      {
+        upsert: true,
+        new: true,
+      },
+    );
+
+    await sendOTPEmail(email, otp);
+
+    return {
+      success: true,
+      message:
+        "Account already exists but is not verified. OTP resent successfully.",
+    };
+  }
+
+  // New User
   const hashedPassword = await bcrypt.hash(password, 10);
 
-  await User.create({
+  const user = await User.create({
     name,
     email,
     password: hashedPassword,
+    isVerified: false,
   });
 
   const otp = generateOTP();
-  const hashOtp = await bcrypt.hash(otp, 10);
+
+  const hashedOTP = await bcrypt.hash(otp, 10);
+
   await OTP.create({
     email,
-    otp: hashOtp,
-    expiresAt: Date.now() + 10 * 60 * 1000,
+    otp: hashedOTP,
+    expiresAt: new Date(Date.now() + 10 * 60 * 1000),
+    lastSentAt: new Date(),
   });
 
   await sendOTPEmail(email, otp);
 
   return {
-    message: "OTP sent",
+    success: true,
+    message: "Registration successful. OTP sent to your email.",
+    userId: user._id,
   };
 };
 
@@ -48,6 +83,10 @@ const verifyOTP = async (email, otp) => {
     throw new Error("User not found");
   }
 
+  if (user.isVerified) {
+    throw new Error("User already verified");
+  }
+
   const otpDoc = await OTP.findOne({ email });
 
   if (!otpDoc) {
@@ -55,7 +94,9 @@ const verifyOTP = async (email, otp) => {
   }
 
   if (otpDoc.expiresAt < Date.now()) {
-    await OTP.deleteOne({ _id: otpDoc._id });
+    await OTP.deleteOne({
+      _id: otpDoc._id,
+    });
 
     throw new Error("OTP expired");
   }
@@ -75,32 +116,147 @@ const verifyOTP = async (email, otp) => {
   });
 
   return {
+    success: true,
     message: "Email verified successfully",
   };
 };
 
 // LOGIN
+const MAX_LOGIN_ATTEMPTS = 3;
+const LOCK_TIME = 15 * 60 * 1000; // 15 minutes
 const loginUser = async (email, password) => {
   const user = await User.findOne({ email });
 
   if (!user) {
-    throw new Error("User not found");
+    throw new Error("Invalid email or password");
   }
 
-  if (!user.isVerified) {
-    throw new Error("Please verify email first");
+  // Check if account is currently locked
+  if (user.lockUntil && user.lockUntil > Date.now()) {
+    const remainingMinutes = Math.ceil(
+      (user.lockUntil - Date.now()) / (60 * 1000),
+    );
+
+    throw new Error(
+      `Account locked. Try again after ${remainingMinutes} minute(s)`,
+    );
   }
 
   const isMatch = await bcrypt.compare(password, user.password);
 
+  // Wrong Password
   if (!isMatch) {
-    throw new Error("Invalid Credentials");
+    const attempts = user.loginAttempts + 1;
+
+    // Lock account after max attempts
+    if (attempts >= MAX_LOGIN_ATTEMPTS) {
+      await User.updateOne(
+        { _id: user._id },
+        {
+          $set: {
+            loginAttempts: 0,
+            lockUntil: new Date(Date.now() + LOCK_TIME),
+          },
+        },
+      );
+
+      throw new Error(
+        "Too many failed login attempts. Account locked for 15 minutes.",
+      );
+    }
+
+    await User.updateOne(
+      { _id: user._id },
+      {
+        $inc: {
+          loginAttempts: 1,
+        },
+      },
+    );
+
+    throw new Error("Invalid email or password");
+  }
+
+  // Password Correct
+  // Reset failed attempts
+  await User.updateOne(
+    { _id: user._id },
+    {
+      $set: {
+        loginAttempts: 0,
+        lockUntil: null,
+      },
+    },
+  );
+
+  // Email verification check
+  if (!user.isVerified) {
+    return {
+      success: false,
+      requiresVerification: true,
+      message: "Please verify your email first",
+    };
   }
 
   const token = generateToken(user._id);
 
   return {
+    success: true,
     token,
+    user: {
+      id: user._id,
+      name: user.name,
+      email: user.email,
+    },
+  };
+};
+
+const resendOTP = async (email) => {
+  const user = await User.findOne({
+    email,
+  });
+
+  if (!user) {
+    throw new Error("User not found");
+  }
+
+  if (user.isVerified) {
+    throw new Error("User already verified");
+  }
+
+  const existingOTP = await OTP.findOne({ email });
+
+  if (existingOTP) {
+    const diff = Date.now() - existingOTP.lastSentAt.getTime();
+
+    if (diff < 300 * 1000) {
+      throw new Error("Please wait 5 min requesting another OTP");
+    }
+  }
+
+  const otp = generateOTP();
+
+  const hashedOTP = await bcrypt.hash(otp, 10);
+
+  await OTP.findOneAndUpdate(
+    { email },
+    {
+      otp: hashedOTP,
+
+      expiresAt: new Date(Date.now() + 10 * 60 * 1000),
+
+      lastSentAt: new Date(),
+    },
+    {
+      upsert: true,
+      new: true,
+    },
+  );
+
+  await sendOTPEmail(email, otp);
+
+  return {
+    message: "OTP sent successfully",
   };
 };
 
@@ -108,4 +264,5 @@ module.exports = {
   registerUser,
   verifyOTP,
   loginUser,
+  resendOTP,
 };
