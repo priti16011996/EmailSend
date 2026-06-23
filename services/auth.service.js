@@ -1,6 +1,7 @@
 const User = require("../models/user.model");
 const OTP = require("../models/otp.model");
 const bcrypt = require("bcryptjs");
+const emailQueue = require("../queues/email.queue");
 
 const generateOTP = require("../utils/generateOTP");
 
@@ -36,7 +37,11 @@ const registerUser = async (name, email, password) => {
       },
     );
 
-    await sendOTPEmail(email, otp);
+    // await sendOTPEmail(email, otp);
+    await emailQueue.add("sendOTP", {
+      email,
+      otp,
+    });
 
     return {
       success: true,
@@ -66,7 +71,22 @@ const registerUser = async (name, email, password) => {
     lastSentAt: new Date(),
   });
 
-  await sendOTPEmail(email, otp);
+  //await sendOTPEmail(email, otp);
+  await emailQueue.add(
+    "sendOTP",
+    {
+      email,
+      otp,
+    },
+    {
+      attempts: 3,
+
+      backoff: {
+        type: "exponential",
+        delay: 5000,
+      },
+    },
+  );
 
   return {
     success: true,
@@ -123,7 +143,7 @@ const verifyOTP = async (email, otp) => {
 
 // LOGIN
 const MAX_LOGIN_ATTEMPTS = 3;
-const LOCK_TIME = 15 * 60 * 1000; // 15 minutes
+const LOCK_TIME = 15 * 60 * 1000; // 15 minutescle
 const loginUser = async (email, password) => {
   const user = await User.findOne({ email });
 
